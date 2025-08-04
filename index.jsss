@@ -1,0 +1,223 @@
+const express = require('express');
+const http = require('http');
+const socketIo = require('socket.io');
+const axios = require('axios');
+const cors = require('cors');
+
+const app = express();
+app.use(cors());
+
+const server = http.createServer(app);
+const io = socketIo(server, {
+  cors: {
+    origin: '*',
+  }
+});
+
+io.setMaxListeners(20); // Increase the limit here
+
+const LARAVEL_API_URL = 'https://users.tctechh.com/api';
+const clients = {};
+const activeRequests = new Map(); // Track active requests and timeouts
+
+// Middleware setup
+app.use(express.json());
+
+// Token validation middleware for Socket.IO
+io.use((socket, next) => {
+  const token = socket.handshake.query.token;
+  if (token) {
+    console.log('Token present, authentication in progress...');
+    next(); // Add real token validation here if needed
+  } else {
+    console.log('No token provided, authentication error.');
+    next(new Error('Authentication error'));
+  }
+});
+
+// Function to handle sending shipment requests to nearest registered drivers or companies
+async function sendShipments(data, entities) {
+  console.log('Starting to send shipments...');
+  console.log(data);
+
+  const promises = data.map((shipment, index) => {
+    const entity = entities[index % entities.length];
+    const socketId = clients[entity.user_id];
+
+    return new Promise((resolve) => {
+      if (socketId) {
+        console.log(`Sending shipment: ${JSON.stringify(shipment)} to Entity ID: ${entity.user_id}`);
+        io.to(socketId).emit('shipment_request', shipment);
+
+        const timeout = setTimeout(() => {
+          console.log(`Shipment request to Entity ID: ${entity.user_id} timed out`);
+          resolve(null);
+        }, 30000);
+
+        activeRequests.set(shipment.id, { resolve, timeout });
+      } else {
+        console.log(`Entity ID: ${entity.user_id} is not registered`);
+        resolve(null);
+      }
+    });
+  });
+
+  await Promise.all(promises);
+  console.log('Finished sending shipments.');
+}
+
+// Endpoint to handle event emission from Laravel
+app.post('/emit', async (req, res) => {
+  const { event, data } = req.body;
+  console.log('Received event:', event, 'with data:', data);
+
+  try {
+    const { data: assignedData } = await axios.get(`${LARAVEL_API_URL}/shipment/${data.id}/assigned`, {
+      headers: {
+        'Authorization': req.headers['authorization']
+      }
+    });
+
+    console.log('Assigned Data Response:', assignedData);
+
+    if (assignedData.hasAssigned) {
+      console.log('Shipment has already been assigned, returning success.');
+      return res.send({ status: 'success' });
+    }
+
+    console.log('Fetching nearest entities based on:', data.origin_lat, data.origin_long);
+
+    const { data: nearestEntities } = await axios.get(`${LARAVEL_API_URL}/nearest-entities`, {
+      params: {
+        latitude: data.origin_lat,
+        longitude: data.origin_long
+      },
+      headers: {
+        'Authorization': req.headers['authorization']
+      }
+    });
+
+    console.log('Nearest Entities Response:', nearestEntities);
+
+    const nearestRegisteredEntities = ([
+      ...(nearestEntities.nearestDriver || []),
+      ...(nearestEntities.nearestCompany || [])
+    ]).filter(entity => clients[entity.user_id]);
+
+    console.log('Filtered Nearest Registered Entities:', nearestRegisteredEntities);
+
+    if (nearestRegisteredEntities.length > 0) {
+      await sendShipments([data], nearestRegisteredEntities);
+    } else {
+      console.warn("No registered drivers or companies found to send shipments.");
+    }
+
+    res.send({ status: 'success' });
+  } catch (error) {
+    console.error('Error fetching nearest entities or sending shipment request:', error);
+    res.status(500).send({ status: 'error', message: 'Internal Server Error' });
+  }
+});
+
+// Socket.io connection handler
+io.on('connection', (socket) => {
+  console.log('A user connected with Socket ID:', socket.id);
+
+  // Register entity with its socket ID
+  socket.on('register', (data) => {
+    if (data.entity_id && socket.id) {
+      clients[data.entity_id] = socket.id;
+      console.log('Registered entity with ID:', data.entity_id, 'Socket ID:', socket.id);
+    } else {
+      console.error('Register event missing entity_id or socket.id');
+    }
+  });
+
+     // Handle location updates from drivers
+  socket.on('update-location', async (data) => {
+    console.log('Location update received:', data);
+
+    // Hit Laravel API endpoint to update location
+    try {
+      const response = await axios.post(`${LARAVEL_API_URL}/companyDriver/location`, {
+        driver_id: data.driverId,
+        latitude: data.latitude,
+        longitude: data.longitude,
+        shipment_id: data.shipmentId,
+        path: data.path || null, // Include if available
+      });
+      console.log('Laravel API response:', response.data);
+    } catch (error) {
+      console.error('Error calling Laravel API:', error.response ? error.response.data : error.message);
+    }
+
+    // Broadcast location update to clients tracking this shipment or driver
+    socket.to(data.shipmentId).emit('driver-location-updated', {
+      driverId: data.driverId,
+      latitude: data.latitude,
+      longitude: data.longitude,
+      shipmentId: data.shipmentId,
+    });
+  });
+
+
+  // Handle joining a room
+  socket.on('join-room', (room_id) => {
+    socket.room_id = room_id;
+    socket.join(room_id);
+    console.log(`${socket.id} joined room ${room_id}`);
+  });
+
+  // Handle sending messages
+  socket.on('send-message', (data) => {
+    socket.to(socket.room_id).emit('new-message', data);
+  });
+
+  // Handle typing events
+  socket.on('typing', (data) => {
+    const isTypingMsg = `${data.name} is typing...`;
+    socket.to(socket.room_id).emit('typing', isTypingMsg);
+  });
+
+  socket.on('stop-typing', () => {
+    socket.to(socket.room_id).emit('stop-typing');
+  });
+
+  // Handle disconnection
+  socket.on('disconnect', () => {
+    console.log('User disconnected with Socket ID:', socket.id);
+    for (const id in clients) {
+      if (clients[id] === socket.id) {
+        delete clients[id];
+        console.log('Unregistered entity with ID:', id);
+        break;
+      }
+    }
+  });
+
+  // Handle shipment responses
+  socket.on('shipment_response', (response) => {
+    console.log('Shipment response received:', response);
+    const request = activeRequests.get(response.requestId);
+    if (request) {
+      clearTimeout(request.timeout);
+      request.resolve(response);
+      activeRequests.delete(response.requestId);
+    } else {
+      console.error('Request not found for ID:', response.requestId);
+    }
+  });
+
+  // Handle any socket errors
+  socket.on('error', (err) => {
+    console.error('Socket error:', err);
+  });
+});
+
+const PORT = 4003;
+server.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+});
+
+
+
